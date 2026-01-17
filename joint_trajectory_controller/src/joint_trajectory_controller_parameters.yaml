@@ -72,6 +72,17 @@ joint_trajectory_controller:
       description: "Command interface name used for setting the speed scaling factor on the hardware."
     }
   }
+  soft_stop: {
+
+    default_ramp_duration: {
+      type: double,
+      default_value: 0.5,
+      description: "Default time in seconds for soft stop ramping when no duration is specified.",
+      validation: {
+        gt_eq<>: 0.0,
+      }
+    }
+  }
   allow_partial_joints_goal: {
     type: bool,
     default_value: false,

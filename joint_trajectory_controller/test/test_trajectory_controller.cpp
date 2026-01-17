@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "builtin_interfaces/msg/duration.hpp"
+#include "control_msgs/msg/interface_value.hpp"
 #include "lifecycle_msgs/msg/state.hpp"
 #include "rclcpp/clock.hpp"
 #include "rclcpp/duration.hpp"
@@ -2711,6 +2712,160 @@ TEST_F(TrajectoryControllerTest, setting_scaling_factor_works_correctly)
   executor.spin_some();
   state = getState();
   EXPECT_EQ(state->speed_scaling_factor, 0.45);
+}
+
+TEST_F(TrajectoryControllerTest, soft_stop_command_updates_state)
+{
+  rclcpp::executors::MultiThreadedExecutor executor;
+  std::vector<rclcpp::Parameter> params = {};
+  SetUpAndActivateTrajectoryController(executor, params);
+  auto soft_stop_pub = node_->create_publisher<control_msgs::msg::InterfaceValue>(
+    controller_name_ + "/soft_stop", rclcpp::SystemDefaultsQoS());
+  subscribeToSoftStopState(executor);
+
+  control_msgs::msg::InterfaceValue cmd;
+  cmd.interface_names = {"target_factor", "duration"};
+  cmd.values = {0.0, 0.0};
+  soft_stop_pub->publish(cmd);
+  traj_controller_->wait_for_trajectory(executor);
+  const auto update_rate = rclcpp::Duration::from_seconds(0.01);
+  const auto time = rclcpp::Time(1, 0, RCL_STEADY_TIME);
+  updateControllerAsync(rclcpp::Duration::from_seconds(0.01), time, update_rate);
+  executor.spin_some();
+  auto state = getSoftStopState();
+  ASSERT_TRUE(state);
+  ASSERT_EQ(state->values.size(), 3u);
+  EXPECT_EQ(static_cast<int>(state->values[0]), 2);
+  EXPECT_EQ(state->values[1], 0.0);
+
+  cmd.values = {1.0, 0.0};
+  soft_stop_pub->publish(cmd);
+  traj_controller_->wait_for_trajectory(executor);
+  updateController();
+  executor.spin_some();
+  state = getSoftStopState();
+  ASSERT_TRUE(state);
+  ASSERT_EQ(state->values.size(), 3u);
+  EXPECT_EQ(static_cast<int>(state->values[0]), 0);
+  EXPECT_EQ(state->values[1], 1.0);
+}
+
+TEST_F(TrajectoryControllerTest, soft_stop_ramp_down_and_up)
+{
+  rclcpp::executors::MultiThreadedExecutor executor;
+  std::vector<rclcpp::Parameter> params = {};
+  SetUpAndActivateTrajectoryController(executor, params);
+  auto soft_stop_pub = node_->create_publisher<control_msgs::msg::InterfaceValue>(
+    controller_name_ + "/soft_stop", rclcpp::SystemDefaultsQoS());
+  subscribeToSoftStopState(executor);
+
+  control_msgs::msg::InterfaceValue cmd;
+  cmd.interface_names = {"target_factor", "duration"};
+  cmd.values = {0.0, 0.2};
+  soft_stop_pub->publish(cmd);
+  traj_controller_->wait_for_trajectory(executor);
+
+  const auto update_rate = rclcpp::Duration::from_seconds(0.01);
+  auto time = rclcpp::Time(1, 0, RCL_STEADY_TIME);
+
+  time = updateControllerAsync(rclcpp::Duration::from_seconds(0.1), time, update_rate);
+  executor.spin_some();
+  auto state = getSoftStopState();
+  ASSERT_TRUE(state);
+  ASSERT_EQ(state->values.size(), 3u);
+  EXPECT_EQ(static_cast<int>(state->values[0]), 1);
+  EXPECT_GT(state->values[1], 0.0);
+  EXPECT_LT(state->values[1], 1.0);
+
+  time = updateControllerAsync(rclcpp::Duration::from_seconds(0.2), time, update_rate);
+  executor.spin_some();
+  state = getSoftStopState();
+  ASSERT_TRUE(state);
+  ASSERT_EQ(state->values.size(), 3u);
+  EXPECT_EQ(static_cast<int>(state->values[0]), 2);
+  EXPECT_NEAR(state->values[1], 0.0, 1e-6);
+
+  cmd.values = {1.0, 0.2};
+  soft_stop_pub->publish(cmd);
+  traj_controller_->wait_for_trajectory(executor);
+
+  time = updateControllerAsync(rclcpp::Duration::from_seconds(0.1), time, update_rate);
+  executor.spin_some();
+  state = getSoftStopState();
+  ASSERT_TRUE(state);
+  ASSERT_EQ(state->values.size(), 3u);
+  EXPECT_EQ(static_cast<int>(state->values[0]), 3);
+  EXPECT_GT(state->values[1], 0.0);
+  EXPECT_LT(state->values[1], 1.0);
+
+  updateControllerAsync(rclcpp::Duration::from_seconds(0.2), time, update_rate);
+  executor.spin_some();
+  state = getSoftStopState();
+  ASSERT_TRUE(state);
+  ASSERT_EQ(state->values.size(), 3u);
+  EXPECT_EQ(static_cast<int>(state->values[0]), 0);
+  EXPECT_NEAR(state->values[1], 1.0, 1e-6);
+}
+
+TEST_F(TrajectoryControllerTest, soft_stop_binary_coercion)
+{
+  rclcpp::executors::MultiThreadedExecutor executor;
+  std::vector<rclcpp::Parameter> params = {};
+  SetUpAndActivateTrajectoryController(executor, params);
+  auto soft_stop_pub = node_->create_publisher<control_msgs::msg::InterfaceValue>(
+    controller_name_ + "/soft_stop", rclcpp::SystemDefaultsQoS());
+  subscribeToSoftStopState(executor);
+
+  const auto update_rate = rclcpp::Duration::from_seconds(0.01);
+  auto time = rclcpp::Time(1, 0, RCL_STEADY_TIME);
+
+  control_msgs::msg::InterfaceValue cmd;
+  cmd.interface_names = {"target_factor", "duration"};
+  cmd.values = {0.0, 0.0};
+  soft_stop_pub->publish(cmd);
+  traj_controller_->wait_for_trajectory(executor);
+  time = updateControllerAsync(rclcpp::Duration::from_seconds(0.01), time, update_rate);
+  executor.spin_some();
+  auto state = getSoftStopState();
+  ASSERT_TRUE(state);
+  ASSERT_EQ(state->values.size(), 3u);
+  EXPECT_EQ(static_cast<int>(state->values[0]), 2);
+  EXPECT_EQ(state->values[1], 0.0);
+
+  cmd.values = {0.2, 0.0};
+  soft_stop_pub->publish(cmd);
+  traj_controller_->wait_for_trajectory(executor);
+  updateControllerAsync(rclcpp::Duration::from_seconds(0.01), time, update_rate);
+  executor.spin_some();
+  state = getSoftStopState();
+  ASSERT_TRUE(state);
+  ASSERT_EQ(state->values.size(), 3u);
+  EXPECT_EQ(static_cast<int>(state->values[0]), 0);
+  EXPECT_EQ(state->values[1], 1.0);
+}
+
+TEST_F(TrajectoryControllerTest, soft_stop_disabled_with_velocity_command_interface)
+{
+  command_interface_types_ = {"position", "velocity"};
+  rclcpp::executors::MultiThreadedExecutor executor;
+  std::vector<rclcpp::Parameter> params = {};
+  SetUpAndActivateTrajectoryController(executor, params);
+  auto soft_stop_pub = node_->create_publisher<control_msgs::msg::InterfaceValue>(
+    controller_name_ + "/soft_stop", rclcpp::SystemDefaultsQoS());
+  subscribeToSoftStopState(executor);
+
+  control_msgs::msg::InterfaceValue cmd;
+  cmd.interface_names = {"target_factor", "duration"};
+  cmd.values = {0.0, 0.0};
+  soft_stop_pub->publish(cmd);
+  traj_controller_->wait_for_trajectory(executor);
+  updateController();
+  executor.spin_some();
+  auto state = getSoftStopState();
+  ASSERT_TRUE(state);
+  ASSERT_EQ(state->values.size(), 3u);
+  EXPECT_EQ(static_cast<int>(state->values[0]), 0);
+  EXPECT_EQ(state->values[1], 1.0);
 }
 
 TEST_F(TrajectoryControllerTest, scaling_factor_from_param)
