@@ -23,6 +23,7 @@
 
 #include "gmock/gmock.h"
 
+#include "control_msgs/msg/interface_value.hpp"
 #include "control_msgs/msg/joint_trajectory_controller_state.hpp"
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
 #include "joint_trajectory_controller/joint_trajectory_controller.hpp"
@@ -466,6 +467,31 @@ public:
     }
   }
 
+  void subscribeToSoftStopState(rclcpp::Executor & executor)
+  {
+    auto traj_lifecycle_node = traj_controller_->get_node();
+
+    using control_msgs::msg::InterfaceValue;
+
+    auto qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable();
+    qos.transient_local();
+    soft_stop_state_subscriber_ = traj_lifecycle_node->create_subscription<InterfaceValue>(
+      controller_name_ + "/soft_stop_state", qos,
+      [&](std::shared_ptr<InterfaceValue> msg)
+      {
+        std::lock_guard<std::mutex> guard(soft_stop_state_mutex_);
+        soft_stop_state_msg_ = msg;
+      });
+
+    const auto timeout = std::chrono::milliseconds{10};
+    const auto until = traj_lifecycle_node->get_clock()->now() + timeout;
+    while (traj_lifecycle_node->get_clock()->now() < until)
+    {
+      executor.spin_some();
+      std::this_thread::sleep_for(std::chrono::microseconds(10));
+    }
+  }
+
   /// Publish trajectory msgs with multiple points
   /**
    *  delay_btwn_points - delay between each points
@@ -649,6 +675,12 @@ public:
     return state_msg_;
   }
 
+  std::shared_ptr<control_msgs::msg::InterfaceValue> getSoftStopState() const
+  {
+    std::lock_guard<std::mutex> guard(soft_stop_state_mutex_);
+    return soft_stop_state_msg_;
+  }
+
   void expectCommandPoint(
     std::vector<double> position, std::vector<double> velocity = {0.0, 0.0, 0.0},
     std::vector<double> effort = {0.0, 0.0, 0.0})
@@ -807,6 +839,9 @@ public:
     state_subscriber_;
   mutable std::mutex state_mutex_;
   std::shared_ptr<control_msgs::msg::JointTrajectoryControllerState> state_msg_;
+  rclcpp::Subscription<control_msgs::msg::InterfaceValue>::SharedPtr soft_stop_state_subscriber_;
+  mutable std::mutex soft_stop_state_mutex_;
+  std::shared_ptr<control_msgs::msg::InterfaceValue> soft_stop_state_msg_;
 
   std::vector<double> joint_pos_;
   std::vector<double> joint_vel_;
