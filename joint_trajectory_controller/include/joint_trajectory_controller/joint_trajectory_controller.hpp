@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "control_msgs/action/follow_joint_trajectory.hpp"
+#include "control_msgs/msg/interface_value.hpp"
 #include "control_msgs/msg/joint_trajectory_controller_state.hpp"
 #include "control_msgs/srv/query_trajectory_state.hpp"
 #include "control_toolbox/pid.hpp"
@@ -258,6 +259,23 @@ protected:
     std::shared_ptr<control_msgs::srv::QueryTrajectoryState::Response> response);
 
 private:
+  enum class SoftStopState : int
+  {
+    INACTIVE = 0,
+    STOPPING = 1,
+    STOPPED = 2,
+    RESUMING = 3,
+    FAILED = 4,
+  };
+
+  struct SoftStopCommand
+  {
+    uint64_t seq{0};
+    double target_factor{1.0};
+    double duration{0.0};
+    bool has_duration{false};
+  };
+
   void update_pids();
 
   bool contains_interface_type(
@@ -268,6 +286,34 @@ private:
     trajectory_msgs::msg::JointTrajectoryPoint & point, size_t size, double value = 0.0);
   void resize_joint_trajectory_point_command(
     trajectory_msgs::msg::JointTrajectoryPoint & point, size_t size, double value = 0.0);
+
+  using SoftStopStateMsg = control_msgs::msg::InterfaceValue;
+  rclcpp::Subscription<SoftStopStateMsg>::SharedPtr soft_stop_cmd_sub_;
+  rclcpp::Publisher<SoftStopStateMsg>::SharedPtr soft_stop_state_pub_;
+  using SoftStopStatePublisher = realtime_tools::RealtimePublisher<SoftStopStateMsg>;
+  std::unique_ptr<SoftStopStatePublisher> soft_stop_state_publisher_;
+  realtime_tools::RealtimeBuffer<SoftStopCommand> soft_stop_cmd_;
+  std::atomic<uint64_t> soft_stop_cmd_seq_{0};
+  uint64_t last_soft_stop_cmd_seq_{0};
+  std::atomic<bool> soft_stop_enabled_{false};
+  std::atomic<double> soft_stop_factor_{1.0};
+  std::atomic<int> soft_stop_state_{static_cast<int>(SoftStopState::INACTIVE)};
+  std::atomic<double> soft_stop_time_remaining_{0.0};
+  rclcpp::Time soft_stop_start_time_;
+  rclcpp::Duration soft_stop_duration_{0, 0};
+  double soft_stop_start_factor_{1.0};
+  double soft_stop_target_factor_{1.0};
+  bool soft_stop_defer_active_{false};
+  double soft_stop_cmd_target_{1.0};
+  double soft_stop_cmd_duration_{0.0};
+
+  bool set_soft_stop_command(double target_factor, bool has_duration, double duration);
+  bool compute_remaining_wall_time(double & remaining_wall_time) const;
+  void apply_soft_stop_command(
+    const rclcpp::Time & time, double target_factor, double ramp_duration);
+  void update_soft_stop(const rclcpp::Time & time);
+  void publish_soft_stop_state(const rclcpp::Time & time);
+  void soft_stop_command_callback(const SoftStopStateMsg & msg);
 
   /**
    * @brief Assigns the values from a trajectory point interface to a joint interface.
