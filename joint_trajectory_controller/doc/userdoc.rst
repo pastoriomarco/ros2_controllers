@@ -187,12 +187,23 @@ The topic interface is a fire-and-forget alternative. Use this interface if you 
 The goal tolerance specification is not used in this case, as there is no mechanism to notify the sender about tolerance violations. If state tolerances are violated, the trajectory is aborted and the current position is held.
 Note that although some degree of monitoring is available through the ``~/query_state`` service and ``~/controller_state`` topic it is much more cumbersome to realize than with the action interface.
 
+<controller_name>/soft_stop [control_msgs::msg::InterfaceValue]
+  Soft stop command interface. Set ``interface_names`` to ``["target_factor", "duration"]``.
+  The ``target_factor`` value is binary (<=0 becomes 0, >0 becomes 1) and ``duration`` is optional (seconds).
+  If the requested ramp duration exceeds the remaining trajectory time, the controller completes
+  the trajectory at the current speed and then holds the final point with the goal kept active.
+  Soft stop is currently supported only for position command interfaces.
+
 
 Publishers
 ,,,,,,,,,,,
 
 <controller_name>/controller_state [control_msgs::msg::JointTrajectoryControllerState]
   Topic publishing internal states with the update-rate of the controller manager
+
+<controller_name>/soft_stop_state [control_msgs::msg::InterfaceValue]
+  Publishes soft stop status with ``interface_names`` = ``["state", "factor", "time_remaining"]``.
+  State values: 0=INACTIVE, 1=STOPPING, 2=STOPPED, 3=RESUMING, 4=FAILED.
 
 
 Services
