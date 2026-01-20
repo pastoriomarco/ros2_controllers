@@ -108,6 +108,17 @@ joint_trajectory_controller:
      ``cmd_timeout`` must be greater than ``constraints.goal_time``, otherwise ignored.
      If zero, timeout is deactivated",
   }
+  soft_stop: {
+
+    default_ramp_duration: {
+      type: double,
+      default_value: 0.5,
+      description: "Default time in seconds for soft stop ramping when no duration is specified.",
+      validation: {
+        gt_eq<>: 0.0,
+      }
+    }
+  }
   gains:
     __map_joints:
       p: {

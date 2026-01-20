@@ -14,8 +14,11 @@
 
 #include "joint_trajectory_controller/joint_trajectory_controller.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <functional>
+#include <limits>
 #include <memory>
 
 #include <string>
@@ -122,6 +125,7 @@ controller_interface::return_type JointTrajectoryController::update(
     return controller_interface::return_type::OK;
   }
   auto logger = this->get_node()->get_logger();
+  update_soft_stop(time);
   // update dynamic parameters
   if (param_listener_->is_old(params_))
   {
@@ -177,6 +181,10 @@ controller_interface::return_type JointTrajectoryController::update(
     sort_to_local_joint_order(*new_external_msg);
     // TODO(denis): Add here integration of position and velocity
     traj_external_point_ptr_->update(*new_external_msg);
+    if (soft_stop_enabled_.load() && soft_stop_defer_active_)
+    {
+      apply_soft_stop_command(time, soft_stop_cmd_target_, soft_stop_cmd_duration_);
+    }
   }
 
   // TODO(anyone): can I here also use const on joint_interface since the reference_wrapper is not
@@ -199,6 +207,7 @@ controller_interface::return_type JointTrajectoryController::update(
   if (has_active_trajectory())
   {
     bool first_sample = false;
+    TrajectoryPointConstIter start_segment_itr, end_segment_itr;
     // if sampling the first time, set the point before you sample
     if (!traj_external_point_ptr_->is_sampled_already())
     {
@@ -213,14 +222,18 @@ controller_interface::return_type JointTrajectoryController::update(
         traj_external_point_ptr_->set_point_before_trajectory_msg(
           time, state_current_, joints_angle_wraparound_);
       }
+      traj_time_ = time;
+    }
+    else
+    {
+      traj_time_ += period * soft_stop_factor_.load();
     }
 
     // find segment for current timestamp
-    TrajectoryPointConstIter start_segment_itr, end_segment_itr;
     const bool valid_point = traj_external_point_ptr_->sample(
-      time, interpolation_method_, state_desired_, start_segment_itr, end_segment_itr);
-    state_desired_.time_from_start = state_current_.time_from_start =
-      time - traj_external_point_ptr_->time_from_start();
+      traj_time_, interpolation_method_, state_desired_, start_segment_itr, end_segment_itr);
+    state_desired_.time_from_start = traj_time_ - traj_external_point_ptr_->time_from_start();
+    state_current_.time_from_start = time - traj_external_point_ptr_->time_from_start();
 
     if (valid_point)
     {
@@ -232,17 +245,18 @@ controller_interface::return_type JointTrajectoryController::update(
       // time_difference is
       // - negative until first point is reached
       // - counting from zero to time_from_start of next point
-      double time_difference = time.seconds() - segment_time_from_start.seconds();
+      double time_difference = traj_time_.seconds() - segment_time_from_start.seconds();
       bool tolerance_violated_while_moving = false;
       bool outside_goal_tolerance = false;
       bool within_goal_time = true;
       const bool before_last_point = end_segment_itr != traj_external_point_ptr_->end();
+      const bool before_last_point_effective = before_last_point || soft_stop_defer_active_;
       auto active_tol = active_tolerances_.readFromRT();
 
       // have we reached the end, are not holding position, and is a timeout configured?
       // Check independently of other tolerances
       if (
-        !before_last_point && !rt_is_holding_ && cmd_timeout_ > 0.0 &&
+        !before_last_point_effective && !rt_is_holding_ && cmd_timeout_ > 0.0 &&
         time_difference > cmd_timeout_)
       {
         RCLCPP_WARN(logger, "Aborted due to command timeout");
@@ -260,7 +274,7 @@ controller_interface::return_type JointTrajectoryController::update(
         // is the last point
         // print output per default, goal will be aborted afterwards
         if (
-          (before_last_point || first_sample) && !rt_is_holding_ &&
+          (before_last_point_effective || first_sample) && !rt_is_holding_ &&
           !check_state_tolerance_per_joint(
             state_error_, index, active_tol->state_tolerance[index], true /* show_errors */))
         {
@@ -268,7 +282,7 @@ controller_interface::return_type JointTrajectoryController::update(
         }
         // past the final point, check that we end up inside goal tolerance
         if (
-          !before_last_point && !rt_is_holding_ &&
+          !before_last_point_effective && !rt_is_holding_ &&
           !check_state_tolerance_per_joint(
             state_error_, index, active_tol->goal_state_tolerance[index], false /* show_errors */))
         {
@@ -363,7 +377,7 @@ controller_interface::return_type JointTrajectoryController::update(
           traj_msg_external_point_ptr_.initRT(set_hold_position());
         }
         // check goal tolerance
-        else if (!before_last_point)
+        else if (!before_last_point_effective)
         {
           if (!outside_goal_tolerance)
           {
@@ -410,7 +424,7 @@ controller_interface::return_type JointTrajectoryController::update(
         traj_msg_external_point_ptr_.reset();
         traj_msg_external_point_ptr_.initRT(set_hold_position());
       }
-      else if (!before_last_point && !within_goal_time && !rt_has_pending_goal_)
+      else if (!before_last_point_effective && !within_goal_time && !rt_has_pending_goal_)
       {
         RCLCPP_ERROR(logger, "Exceeded goal_time_tolerance: holding position...");
 
@@ -424,6 +438,7 @@ controller_interface::return_type JointTrajectoryController::update(
   }
 
   publish_state(state_desired_, state_current_, state_error_);
+  publish_soft_stop_state(time);
   return controller_interface::return_type::OK;
 }
 
@@ -837,11 +852,50 @@ controller_interface::CallbackReturn JointTrajectoryController::on_configure(
   // prepare hold_position_msg
   init_hold_position_msg();
 
+  const bool soft_stop_supported = !has_velocity_command_interface_ &&
+                                   !has_acceleration_command_interface_ &&
+                                   !has_effort_command_interface_;
+  soft_stop_enabled_.store(soft_stop_supported);
+  if (!soft_stop_supported)
+  {
+    RCLCPP_WARN(
+      logger.get_child("soft_stop"),
+      "Soft stop is currently only supported for position interfaces. If you want to make use of "
+      "soft stop, please only use a position interface when configuring this controller.");
+  }
+
   // create subscriber and publishers
   joint_command_subscriber_ =
     get_node()->create_subscription<trajectory_msgs::msg::JointTrajectory>(
       "~/joint_trajectory", rclcpp::SystemDefaultsQoS(),
       std::bind(&JointTrajectoryController::topic_callback, this, std::placeholders::_1));
+
+  {
+    auto qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable();
+    qos.transient_local();
+    soft_stop_state_pub_ = get_node()->create_publisher<SoftStopStateMsg>("~/soft_stop_state", qos);
+    soft_stop_state_publisher_ = std::make_unique<SoftStopStatePublisher>(soft_stop_state_pub_);
+    soft_stop_state_publisher_->lock();
+    soft_stop_state_publisher_->msg_.interface_names = {"state", "factor", "time_remaining"};
+    soft_stop_state_publisher_->msg_.values = {
+      static_cast<double>(SoftStopState::INACTIVE), 1.0, 0.0};
+    soft_stop_state_publisher_->unlock();
+  }
+
+  soft_stop_cmd_.writeFromNonRT(SoftStopCommand{});
+  if (soft_stop_supported)
+  {
+    auto qos = rclcpp::SystemDefaultsQoS();
+    qos.transient_local();
+    soft_stop_cmd_sub_ = get_node()->create_subscription<SoftStopStateMsg>(
+      "~/soft_stop", qos,
+      std::bind(
+        &JointTrajectoryController::soft_stop_command_callback, this, std::placeholders::_1));
+  }
+  else
+  {
+    soft_stop_cmd_sub_.reset();
+  }
 
   // State publisher
   RCLCPP_INFO(logger, "Controller state will be published at %.2f Hz.", params_.state_publish_rate);
@@ -1000,6 +1054,16 @@ controller_interface::CallbackReturn JointTrajectoryController::on_activate(
 
   subscriber_is_active_ = true;
   last_state_publish_time_ = get_node()->now();
+  soft_stop_factor_.store(1.0);
+  soft_stop_state_.store(static_cast<int>(SoftStopState::INACTIVE));
+  soft_stop_time_remaining_.store(0.0);
+  soft_stop_start_factor_ = 1.0;
+  soft_stop_target_factor_ = 1.0;
+  soft_stop_duration_ = rclcpp::Duration(0, 0);
+  soft_stop_defer_active_ = false;
+  soft_stop_cmd_target_ = 1.0;
+  soft_stop_cmd_duration_ = 0.0;
+  last_soft_stop_cmd_seq_ = 0;
 
   // Handle restart of controller by reading from commands if those are not NaN (a controller was
   // running already)
@@ -1099,6 +1163,12 @@ controller_interface::CallbackReturn JointTrajectoryController::on_deactivate(
   release_interfaces();
 
   subscriber_is_active_ = false;
+  soft_stop_factor_.store(1.0);
+  soft_stop_state_.store(static_cast<int>(SoftStopState::INACTIVE));
+  soft_stop_time_remaining_.store(0.0);
+  soft_stop_defer_active_ = false;
+  soft_stop_cmd_target_ = 1.0;
+  soft_stop_cmd_duration_ = 0.0;
 
   traj_external_point_ptr_.reset();
 
@@ -1125,6 +1195,7 @@ bool JointTrajectoryController::reset()
 {
   subscriber_is_active_ = false;
   joint_command_subscriber_.reset();
+  soft_stop_cmd_sub_.reset();
 
   for (const auto & pid : pids_)
   {
@@ -1135,6 +1206,13 @@ bool JointTrajectoryController::reset()
   }
 
   traj_external_point_ptr_.reset();
+
+  soft_stop_factor_.store(1.0);
+  soft_stop_state_.store(static_cast<int>(SoftStopState::INACTIVE));
+  soft_stop_time_remaining_.store(0.0);
+  soft_stop_defer_active_ = false;
+  soft_stop_cmd_target_ = 1.0;
+  soft_stop_cmd_duration_ = 0.0;
 
   return true;
 }
@@ -1229,6 +1307,294 @@ void JointTrajectoryController::publish_state(
     }
 
     state_publisher_->unlockAndPublish();
+  }
+}
+
+void JointTrajectoryController::publish_soft_stop_state(const rclcpp::Time & time)
+{
+  (void)time;
+  if (soft_stop_state_publisher_ && soft_stop_state_publisher_->trylock())
+  {
+    soft_stop_state_publisher_->msg_.values[0] = static_cast<double>(soft_stop_state_.load());
+    soft_stop_state_publisher_->msg_.values[1] = soft_stop_factor_.load();
+    soft_stop_state_publisher_->msg_.values[2] = soft_stop_time_remaining_.load();
+    soft_stop_state_publisher_->unlockAndPublish();
+  }
+}
+
+bool JointTrajectoryController::set_soft_stop_command(
+  double target_factor, bool has_duration, double duration)
+{
+  auto logger = get_node()->get_logger().get_child("soft_stop");
+  if (!std::isfinite(target_factor))
+  {
+    RCLCPP_WARN(logger, "Soft stop command ignored: 'target_factor' is not finite.");
+    return false;
+  }
+  if (has_duration && !std::isfinite(duration))
+  {
+    RCLCPP_WARN(logger, "Soft stop command ignored: 'duration' is not finite.");
+    return false;
+  }
+
+  const double raw_target = target_factor;
+  target_factor = (raw_target <= 0.0) ? 0.0 : 1.0;
+  if (raw_target != target_factor)
+  {
+    RCLCPP_WARN(
+      logger, "Soft stop target_factor is binary. Coercing %f to %f.", raw_target, target_factor);
+  }
+
+  SoftStopCommand cmd;
+  cmd.seq = soft_stop_cmd_seq_.fetch_add(1) + 1;
+  cmd.target_factor = target_factor;
+  cmd.duration = duration;
+  cmd.has_duration = has_duration;
+  soft_stop_cmd_.writeFromNonRT(cmd);
+  return true;
+}
+
+bool JointTrajectoryController::compute_remaining_wall_time(double & remaining_wall_time) const
+{
+  if (!has_active_trajectory())
+  {
+    return false;
+  }
+
+  const auto traj_msg = traj_external_point_ptr_->get_trajectory_msg();
+  if (!traj_msg || traj_msg->points.empty())
+  {
+    return false;
+  }
+
+  const double total_time = rclcpp::Duration(traj_msg->points.back().time_from_start).seconds();
+  double elapsed_time = 0.0;
+  if (traj_external_point_ptr_->is_sampled_already())
+  {
+    const auto traj_start = traj_external_point_ptr_->time_from_start();
+    elapsed_time = (traj_time_ - traj_start).seconds();
+    if (!std::isfinite(elapsed_time) || elapsed_time < 0.0)
+    {
+      elapsed_time = 0.0;
+    }
+  }
+  const double remaining_traj_time = std::max(0.0, total_time - elapsed_time);
+
+  constexpr double kEps = 1e-9;
+  const double effective_scale = std::max(kEps, soft_stop_factor_.load());
+  remaining_wall_time = remaining_traj_time / effective_scale;
+  return true;
+}
+
+void JointTrajectoryController::apply_soft_stop_command(
+  const rclcpp::Time & time, double target_factor, double ramp_duration)
+{
+  constexpr double kEps = 1e-9;
+
+  soft_stop_cmd_target_ = target_factor;
+  soft_stop_cmd_duration_ = ramp_duration;
+  soft_stop_defer_active_ = false;
+
+  const double target = std::clamp(target_factor, 0.0, 1.0);
+  const double start = soft_stop_factor_.load();
+
+  double remaining_wall_time = 0.0;
+  if (
+    target <= kEps && compute_remaining_wall_time(remaining_wall_time) &&
+    ramp_duration > remaining_wall_time)
+  {
+    soft_stop_start_time_ = time;
+    soft_stop_start_factor_ = start;
+    soft_stop_target_factor_ = target;
+    soft_stop_duration_ = rclcpp::Duration::from_seconds(ramp_duration);
+
+    soft_stop_defer_active_ = true;
+    soft_stop_factor_.store(start);
+    soft_stop_state_.store(static_cast<int>(SoftStopState::STOPPING));
+    soft_stop_time_remaining_.store(std::max(0.0, remaining_wall_time));
+    return;
+  }
+
+  soft_stop_start_time_ = time;
+  soft_stop_start_factor_ = start;
+  soft_stop_target_factor_ = target;
+  soft_stop_duration_ = rclcpp::Duration::from_seconds(ramp_duration);
+
+  if (ramp_duration <= 0.0)
+  {
+    soft_stop_factor_.store(target);
+    soft_stop_time_remaining_.store(0.0);
+    if (target <= kEps)
+    {
+      soft_stop_state_.store(static_cast<int>(SoftStopState::STOPPED));
+    }
+    else if (target >= 1.0 - kEps)
+    {
+      soft_stop_state_.store(static_cast<int>(SoftStopState::INACTIVE));
+    }
+    else
+    {
+      soft_stop_state_.store(static_cast<int>(SoftStopState::STOPPED));
+    }
+    return;
+  }
+
+  if (target < start)
+  {
+    soft_stop_state_.store(static_cast<int>(SoftStopState::STOPPING));
+  }
+  else
+  {
+    soft_stop_state_.store(static_cast<int>(SoftStopState::RESUMING));
+  }
+  soft_stop_time_remaining_.store(ramp_duration);
+}
+
+void JointTrajectoryController::soft_stop_command_callback(const SoftStopStateMsg & msg)
+{
+  auto logger = get_node()->get_logger().get_child("soft_stop");
+  if (msg.interface_names.size() != msg.values.size())
+  {
+    RCLCPP_WARN(logger, "Soft stop command ignored: interface/values size mismatch.");
+    return;
+  }
+
+  bool has_target = false;
+  double target_factor = 1.0;
+  bool has_duration = false;
+  double duration = 0.0;
+  for (size_t index = 0; index < msg.interface_names.size(); ++index)
+  {
+    const auto & name = msg.interface_names[index];
+    if (name == "target_factor")
+    {
+      target_factor = msg.values[index];
+      has_target = true;
+    }
+    else if (name == "duration")
+    {
+      duration = msg.values[index];
+      has_duration = true;
+    }
+  }
+
+  if (!has_target)
+  {
+    RCLCPP_WARN(logger, "Soft stop command ignored: missing 'target_factor' interface name.");
+    return;
+  }
+
+  (void)set_soft_stop_command(target_factor, has_duration, duration);
+}
+
+void JointTrajectoryController::update_soft_stop(const rclcpp::Time & time)
+{
+  if (!soft_stop_enabled_.load())
+  {
+    soft_stop_factor_.store(1.0);
+    soft_stop_state_.store(static_cast<int>(SoftStopState::INACTIVE));
+    soft_stop_time_remaining_.store(0.0);
+    soft_stop_defer_active_ = false;
+    soft_stop_cmd_target_ = 1.0;
+    soft_stop_cmd_duration_ = 0.0;
+    return;
+  }
+
+  constexpr double kEps = 1e-9;
+  constexpr double kPi = 3.141592653589793;
+
+  const auto * cmd = soft_stop_cmd_.readFromRT();
+  if (cmd && cmd->seq != last_soft_stop_cmd_seq_)
+  {
+    last_soft_stop_cmd_seq_ = cmd->seq;
+    double ramp_duration =
+      cmd->has_duration ? cmd->duration : params_.soft_stop.default_ramp_duration;
+    if (!std::isfinite(ramp_duration) || ramp_duration < 0.0)
+    {
+      ramp_duration = 0.0;
+    }
+
+    const auto state = static_cast<SoftStopState>(soft_stop_state_.load());
+    const double current_duration = soft_stop_duration_.seconds();
+    const double target = std::clamp(cmd->target_factor, 0.0, 1.0);
+    const bool same_duration = std::abs(current_duration - ramp_duration) < kEps;
+    const bool redundant_stop = state == SoftStopState::STOPPING && target <= kEps && same_duration;
+    const bool redundant_resume =
+      state == SoftStopState::RESUMING && target >= 1.0 - kEps && same_duration;
+
+    if (!redundant_stop && !redundant_resume)
+    {
+      apply_soft_stop_command(time, cmd->target_factor, ramp_duration);
+    }
+  }
+
+  if (soft_stop_defer_active_)
+  {
+    double remaining_wall_time = 0.0;
+    if (compute_remaining_wall_time(remaining_wall_time) && remaining_wall_time > kEps)
+    {
+      soft_stop_factor_.store(soft_stop_start_factor_);
+      soft_stop_state_.store(static_cast<int>(SoftStopState::STOPPING));
+      soft_stop_time_remaining_.store(remaining_wall_time);
+    }
+    else
+    {
+      soft_stop_factor_.store(0.0);
+      soft_stop_state_.store(static_cast<int>(SoftStopState::STOPPED));
+      soft_stop_time_remaining_.store(0.0);
+    }
+    return;
+  }
+
+  const auto state = static_cast<SoftStopState>(soft_stop_state_.load());
+  if (state == SoftStopState::STOPPING || state == SoftStopState::RESUMING)
+  {
+    const double duration = soft_stop_duration_.seconds();
+    if (duration <= 0.0)
+    {
+      soft_stop_factor_.store(soft_stop_target_factor_);
+      soft_stop_time_remaining_.store(0.0);
+      if (soft_stop_target_factor_ <= kEps)
+      {
+        soft_stop_state_.store(static_cast<int>(SoftStopState::STOPPED));
+      }
+      else
+      {
+        soft_stop_state_.store(static_cast<int>(SoftStopState::INACTIVE));
+      }
+      return;
+    }
+
+    const double elapsed = (time - soft_stop_start_time_).seconds();
+    const double clamped = std::clamp(elapsed / duration, 0.0, 1.0);
+    const double eased = 0.5 - 0.5 * std::cos(kPi * clamped);
+    const double factor =
+      soft_stop_start_factor_ + (soft_stop_target_factor_ - soft_stop_start_factor_) * eased;
+
+    soft_stop_factor_.store(factor);
+    soft_stop_time_remaining_.store(std::max(0.0, duration - elapsed));
+
+    if (clamped >= 1.0 - kEps)
+    {
+      soft_stop_factor_.store(soft_stop_target_factor_);
+      soft_stop_time_remaining_.store(0.0);
+      if (soft_stop_target_factor_ <= kEps)
+      {
+        soft_stop_state_.store(static_cast<int>(SoftStopState::STOPPED));
+      }
+      else if (soft_stop_target_factor_ >= 1.0 - kEps)
+      {
+        soft_stop_state_.store(static_cast<int>(SoftStopState::INACTIVE));
+      }
+      else
+      {
+        soft_stop_state_.store(static_cast<int>(SoftStopState::STOPPED));
+      }
+    }
+  }
+  else
+  {
+    soft_stop_time_remaining_.store(0.0);
   }
 }
 
