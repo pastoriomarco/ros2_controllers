@@ -265,7 +265,6 @@ private:
     STOPPING = 1,
     STOPPED = 2,
     RESUMING = 3,
-    FAILED = 4,
   };
 
   struct SoftStopCommand
