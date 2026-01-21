@@ -1551,6 +1551,11 @@ void JointTrajectoryController::apply_soft_stop_command(
 void JointTrajectoryController::soft_stop_command_callback(const SoftStopStateMsg & msg)
 {
   auto logger = get_node()->get_logger().get_child("soft_stop");
+  if (msg.interface_names.size() != msg.values.size())
+  {
+    RCLCPP_WARN(logger, "Soft stop command ignored: interface/values size mismatch.");
+    return;
+  }
 
   bool has_target = false;
   double target_factor = 1.0;
@@ -1558,10 +1563,6 @@ void JointTrajectoryController::soft_stop_command_callback(const SoftStopStateMs
   bool has_duration = false;
   for (size_t index = 0; index < msg.interface_names.size(); ++index)
   {
-    if (index >= msg.values.size())
-    {
-      break;
-    }
     const auto & name = msg.interface_names[index];
     if (name == "target_factor")
     {
