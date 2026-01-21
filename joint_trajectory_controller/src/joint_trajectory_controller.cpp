@@ -1420,7 +1420,7 @@ void JointTrajectoryController::apply_soft_stop_command(
   soft_stop_target_factor_ = target;
   soft_stop_duration_ = rclcpp::Duration::from_seconds(ramp_duration);
 
-  if (ramp_duration <= 0.0)
+  if (std::abs(target - start) < kEps || ramp_duration <= 0.0)
   {
     soft_stop_factor_.store(target);
     soft_stop_time_remaining_.store(0.0);

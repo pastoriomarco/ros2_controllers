@@ -201,7 +201,7 @@ Publishers
 
 <controller_name>/soft_stop_state [control_msgs::msg::InterfaceValue]
   Publishes soft stop status with ``interface_names`` = ``["state", "factor", "time_remaining"]``.
-  State values: 0=INACTIVE, 1=STOPPING, 2=STOPPED, 3=RESUMING, 4=FAILED.
+  State values: 0=INACTIVE, 1=STOPPING, 2=STOPPED, 3=RESUMING.
 
 
 Services
