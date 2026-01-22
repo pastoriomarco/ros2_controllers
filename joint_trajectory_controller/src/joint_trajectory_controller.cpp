@@ -73,6 +73,27 @@ controller_interface::CallbackReturn JointTrajectoryController::on_init()
       "true. The default behavior will change to false.");
   }
 
+  {
+    auto qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable();
+    qos.transient_local();
+    soft_stop_state_pub_ = get_node()->create_publisher<SoftStopStateMsg>("~/soft_stop_state", qos);
+    soft_stop_state_publisher_ = std::make_unique<SoftStopStatePublisher>(soft_stop_state_pub_);
+    soft_stop_state_publisher_->lock();
+    soft_stop_state_publisher_->msg_.interface_names = {"state", "factor", "time_remaining"};
+    soft_stop_state_publisher_->msg_.values = {
+      static_cast<double>(SoftStopState::INACTIVE), 1.0, 0.0};
+    soft_stop_state_publisher_->unlock();
+  }
+
+  {
+    auto qos = rclcpp::SystemDefaultsQoS();
+    qos.transient_local();
+    soft_stop_cmd_sub_ = get_node()->create_subscription<SoftStopStateMsg>(
+      "~/soft_stop", qos,
+      std::bind(
+        &JointTrajectoryController::soft_stop_command_callback, this, std::placeholders::_1));
+  }
+
   return CallbackReturn::SUCCESS;
 }
 
@@ -870,32 +891,7 @@ controller_interface::CallbackReturn JointTrajectoryController::on_configure(
       "~/joint_trajectory", rclcpp::SystemDefaultsQoS(),
       std::bind(&JointTrajectoryController::topic_callback, this, std::placeholders::_1));
 
-  {
-    auto qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable();
-    qos.transient_local();
-    soft_stop_state_pub_ = get_node()->create_publisher<SoftStopStateMsg>("~/soft_stop_state", qos);
-    soft_stop_state_publisher_ = std::make_unique<SoftStopStatePublisher>(soft_stop_state_pub_);
-    soft_stop_state_publisher_->lock();
-    soft_stop_state_publisher_->msg_.interface_names = {"state", "factor", "time_remaining"};
-    soft_stop_state_publisher_->msg_.values = {
-      static_cast<double>(SoftStopState::INACTIVE), 1.0, 0.0};
-    soft_stop_state_publisher_->unlock();
-  }
-
   soft_stop_cmd_.writeFromNonRT(SoftStopCommand{});
-  if (soft_stop_supported)
-  {
-    auto qos = rclcpp::SystemDefaultsQoS();
-    qos.transient_local();
-    soft_stop_cmd_sub_ = get_node()->create_subscription<SoftStopStateMsg>(
-      "~/soft_stop", qos,
-      std::bind(
-        &JointTrajectoryController::soft_stop_command_callback, this, std::placeholders::_1));
-  }
-  else
-  {
-    soft_stop_cmd_sub_.reset();
-  }
 
   // State publisher
   RCLCPP_INFO(logger, "Controller state will be published at %.2f Hz.", params_.state_publish_rate);
@@ -1195,7 +1191,6 @@ bool JointTrajectoryController::reset()
 {
   subscriber_is_active_ = false;
   joint_command_subscriber_.reset();
-  soft_stop_cmd_sub_.reset();
 
   for (const auto & pid : pids_)
   {
@@ -1452,6 +1447,10 @@ void JointTrajectoryController::apply_soft_stop_command(
 
 void JointTrajectoryController::soft_stop_command_callback(const SoftStopStateMsg & msg)
 {
+  if (!soft_stop_enabled_.load())
+  {
+    return;
+  }
   auto logger = get_node()->get_logger().get_child("soft_stop");
   if (msg.interface_names.size() != msg.values.size())
   {
